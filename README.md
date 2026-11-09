@@ -1,4 +1,4 @@
-## Adventure game template demo
+## Adventure Game Template Demo
 <p align="center">
   <img src="mall3.png" width="49%">
   <img src="mall0.png" width="49%">
