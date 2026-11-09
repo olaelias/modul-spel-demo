@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="sv"><head><meta charset="utf-8"><title>Mall – steg 9</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>html,body{margin:0;height:100%;background:#0b0b10;overflow:hidden}
+#c{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:#000}</style></head>
+<body><canvas id="c"></canvas>
+<script>
+'use strict';
+/* ============================================================================
+   MALL – STEG 0.  Allt är uppdelat i taggade sektioner: sök på "[TAGG]".
+   Regel: nytt innehåll läggs i [REG:*] (register) eller i en egen [SCENE:*].
+   Kärnan ([CORE] ... [UI]) ska sällan behöva röras.
+   Allt slumpas från EN seed (G.seed) => kartor är identiska tills omstart,
+   och en sparfil blir senare bara G som JSON.
+   ============================================================================ */
+
+/* ===== [CORE] canvas, skalning, scenbyte, huvudloop ===== */
+const cv=document.getElementById('c'),g=cv.getContext('2d');
+let VW=960,VH=540,clock=0;                       // logisk storlek (varje scen anger egen), speltid
+function setSize(w,h){VW=w;VH=h;cv.width=w;cv.height=h;fit()}
+function fit(){const k=Math.min(innerWidth/VW,innerHeight/VH);cv.style.width=VW*k+'px';cv.style.height=VH*k+'px'}
+addEventListener('resize',fit);
+const SCENES={};                                 // [REG:SCENES] fylls av [SCENE:*]-sektionerna
+let scene=null;
+function go(id,p){                               // byt scen: go('town')
+  if(scene&&scene.exit)scene.exit();
+  scene=SCENES[id];scene.id=id;UI.cur=null;scene.enter(p||{});setSize(scene.w,scene.h);Music.play(scene.music);if(G&&id!=='title')autoSave();   // autospar vid varje scenbyte
+}
+const DT=1/60;let last=0,acc=0;
+function frame(t){requestAnimationFrame(frame);acc+=Math.min(.1,(t-last)/1000||0);last=t;
+  while(acc>=DT){step();acc-=DT}
+  g.clearRect(0,0,VW,VH);scene.draw();if(UI.cur)UI.draw()}
+function step(){clock+=DT;Music.tick();
+  if(A.hit('mute'))SND.toggle();
+  if(UI.cur)UI.update();
+  else if(scene.id!=='title'&&(A.hit('pause')||(M.click&&!(scene.click&&scene.click()))))pauseMenu();   // ENTER eller musklick (vänsterklick). Byt M.click mot M.rclick här om menyn senare ska flyttas till högerklick
+  else scene.update(DT);
+  A.endFrame()}
+function pauseMenu(){const home=scene.id==='world';   // ENTER = paus i alla scener utom titel
+  UI.menu('PAUS',home?['Fortsätt','Spara till fil','Ladda från fil','Till titelskärmen']:['Fortsätt','Återgå till kartan'],i=>{
+    if(!home){if(i===1)go('world')}else if(i===1){saveFile();autoSave();UI.dialog(['Sparat (fil + autospar).'])}else if(i===2)pickFile();else if(i===3)go('title')})}
+
+/* ===== [INPUT] handlingar istället för tangenter – varje scen tolkar dem själv ===== */
+const KEYMAP={left:['ArrowLeft','KeyA'],right:['ArrowRight','KeyD'],up:['ArrowUp','KeyW'],down:['ArrowDown','KeyS'],
+  confirm:['Space','KeyZ'],cancel:['Escape','KeyX'],pause:['Enter'],mute:['KeyM']};
+const A={held:{},pressed:{},hit(a){return!!this.pressed[a]},down(a){return!!this.held[a]},endFrame(){this.pressed={};M.click=0;M.moved=0}};
+const M={x:-1,y:-1,moved:0,click:0};              // mus i logiska canvaskoordinater; click/moved gäller en frame
+const mpos=e=>{const r=cv.getBoundingClientRect();M.x=(e.clientX-r.left)*VW/r.width;M.y=(e.clientY-r.top)*VH/r.height};
+cv.addEventListener('mousemove',e=>{mpos(e);M.moved=1});
+cv.addEventListener('mousedown',e=>{if(e.button===0){mpos(e);M.click=1;SND.init()}});
+const axis=(n,p)=>(A.down(p)?1:0)-(A.down(n)?1:0);
+addEventListener('keydown',e=>{for(const a in KEYMAP)if(KEYMAP[a].includes(e.code)){if(!A.held[a])A.pressed[a]=1;A.held[a]=1;e.preventDefault()}SND.init()});
+addEventListener('keyup',e=>{for(const a in KEYMAP)if(KEYMAP[a].includes(e.code))A.held[a]=0});
+
+/* ===== [RNG] seed -> delseed per modul ===== */
+function mulberry32(a){return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function seedOf(base,tag){let h=base>>>0;for(const c of tag)h=Math.imul(h^c.charCodeAt(0),2654435761)>>>0;return h}
+const rngFor=tag=>mulberry32(seedOf(G.seed,tag));  // t.ex. rngFor('world'), rngFor('town')
+
+/* ===== [STATE] spelets tillstånd. ENDAST ren JSON-data här (inga Map/Set/funktioner) ===== */
+let G=null;
+const CODE={grass:'g',sand:'s',tree:'t',rock:'r',water:'w',portal:'p',floor:'f',wall:'W',cfloor:'c',cwall:'C',gate:'G',crate:'k',ccrate:'K',rblock:'b'}; // APPEND-ONLY: ändra aldrig befintliga koder
+const BNAME=Object.fromEntries(Object.entries(CODE).map(([k,v])=>[v,k]));
+const enc=m=>m.map(row=>row.map(n=>CODE[n]).join('')),dec=rows=>rows.map(s=>[...s].map(c=>BNAME[c]));
+const GEN={};                                    // [REG:GEN] GEN[id]=()=>data. Ny scen: registrera generator här, läs G.maps[id] i enter()
+const encodeWorld=w=>({rows:enc(w.m),start:w.start,portals:w.portals});
+function decodeWorld(d){const pt={};d.portals.forEach(p=>pt[p.id]=p.type);return{m:dec(d.rows),start:d.start,portals:d.portals,pt}}
+/* ===== nivåer, stats och stridsformel. Allt härleds vid körning ur G.lv (sparas aldrig som värden) ===== */
+const MAXLV=80;
+const needExp=L=>L>=MAXLV?Infinity:Math.round((5*L+5)/(1-Math.pow(L/MAXLV,4)));   // EXP från nivå L till L+1: 10,15,20… och "lodrät" mot nivå 80
+const hpMax=G=>Math.round(30+570/79*(G.lv-1));                                      // 30 på nivå 1, 600 på nivå 80
+const HEARTU=[10,20,25,50,100,200,250,500,1000];
+const heartU=G=>HEARTU.find(u=>Math.ceil(hpMax(G)/u)<=8)||1000;                      // HP per visat hjärta: minsta runda tal som ger högst 8 hjärtan (30 HP→10, 600 HP→100)
+const stats=G=>({hp:hpMax(G),atk:Math.round(10+3.5*(G.lv-1)),def:Math.round(2.2*(G.lv-1)),rate:1,spd:1,str:1+(G.lv-1)/20});
+const dealt=(A,D)=>Math.max(1,Math.round(A*A/(A+D)));                                // skada = A²/(A+D): jämn kurva, aldrig 0, aldrig negativ
+const power=G=>{const s=stats(G);return s.rate*s.hp*(s.atk+s.def)};                  // atk·rate·(effektiv HP mot jämnstark fiende); all balansering utgår från denna
+const zoneF=L=>1+.35*(L-1);                                                          // fiendens stat-faktor för zon med nivå L (samma tillväxt som spelarens atk)
+const EXPK=1,zoneExp=(base,L)=>Math.round(base*Math.pow(zoneF(L),EXPK));   // EXP följer fiendens styrka (EXPK=1). Höj EXPK över 1 om balanstestet visar att svåra zoner behöver extra belöning
+const FX={msg:'',until:0};                                                           // tillfällig bannertext (sparas inte)
+function gainExp(n){let up=0;G.exp+=n;while(G.lv<MAXLV&&G.exp>=needExp(G.lv)){const m0=hpMax(G);G.exp-=needExp(G.lv);G.lv++;G.hp+=hpMax(G)-m0;up++}
+  if(G.lv>=MAXLV)G.exp=0;if(up){FX.msg='NIVÅ '+G.lv+'!';FX.until=clock+2.5;SND.sfx('ok')}}
+function newGame(){G={v:SAVE_V,seed:(Math.random()*2**32)>>>0,gold:50,lv:1,exp:0,hp:0,lastPortal:null,skip:null,flags:{},maps:{}};   // lastPortal = ID "x,y"
+  G.hp=hpMax(G);WORLD=null;for(const k in GEN)G.maps[k]=GEN[k]()}   // hela världen genereras EN gång och sparas i G.maps
+/* ===== [SAVE] versionerat sparformat: JSON-fil (export/import) + localStorage-autospar ===== */
+const SAVE_V=6,SAVE_KEY='mall_autosave',MIGRATIONS={1:o=>{o.lv=1;o.exp=0;if(o.maps.cave&&o.maps.cave.lvl==null)o.maps.cave.lvl=1;o.v=2},2:o=>{o.maps.airfield.bands=airBands(o.seed,o.maps.airfield.dur);o.v=3},3:o=>{if(o.maps.ruins&&o.maps.ruins.lvl==null)o.maps.ruins.lvl=1;o.v=4},4:o=>{const a=o.maps.airfield;a.balloons=airBalloons(o.seed,a.dur,a.obs);a.zeps=airZeps(o.seed,a.dur);o.v=5},5:o=>{o.maps.airfield.zeps=airZeps(o.seed,o.maps.airfield.dur);o.v=6}};   // MIGRATIONS[n]=o=>{...;o.v=n+1}  (n = gammal version)
+const serialize=()=>JSON.stringify(G);
+function migrate(o){if(!o||typeof o.seed!=='number'||!o.maps)throw Error('Ogiltig sparfil');
+  o.v=o.v||1;if(o.v>SAVE_V)throw Error('Sparfilen är från en nyare version');
+  while(o.v<SAVE_V){const f=MIGRATIONS[o.v];if(!f)throw Error('Okänd sparversion '+o.v);f(o)}
+  for(const k in GEN)if(!o.maps[k])throw Error('Sparfilen saknar '+k);return o}
+function restore(j){G=migrate(JSON.parse(j));G.skip=null;WORLD=null}
+function loadText(t){try{restore(t);go('world')}catch(e){UI.dialog(['Kunde inte ladda: '+e.message])}}
+function autoSave(){try{localStorage.setItem(SAVE_KEY,serialize())}catch(e){}}
+function autoRaw(){try{return localStorage.getItem(SAVE_KEY)}catch(e){return null}}
+function saveFile(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([serialize()],{type:'application/json'}));a.download='mall-sparfil.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+const fin=document.createElement('input');fin.type='file';fin.accept='.json,application/json';
+fin.onchange=()=>{const f=fin.files[0];fin.value='';if(f)f.text().then(loadText)};
+const pickFile=()=>fin.click();
+const P={x:0,y:0,vy:0,face:0,ph:0,mv:0};         // gemensam spelarfigur (face: 0 ner,1 upp,2 vänster,3 höger)
+
+/* ===== [AUDIO] ljudeffekter + musikmotor (slingor ligger i [REG:TRACKS]) ===== */
+const SND={ctx:null,mute:false,
+  init(){if(this.ctx)return;try{this.ctx=new(window.AudioContext||window.webkitAudioContext)();this.master=this.ctx.createGain();
+    this.master.gain.value=.5;this.master.connect(this.ctx.destination);Music.start()}catch(e){}},
+  toggle(){this.mute=!this.mute;if(this.master)this.master.gain.value=this.mute?0:.5},
+  tone(f,d,type='square',v=.05,t){const c=this.ctx;if(!c)return;t=t??c.currentTime;const o=c.createOscillator(),n=c.createGain();
+    o.type=type;o.frequency.value=f;n.gain.setValueAtTime(v,t);n.gain.exponentialRampToValueAtTime(.001,t+d);o.connect(n);n.connect(this.master);o.start(t);o.stop(t+d)},
+  boing(d){const c=this.ctx;if(!c)return;if(c.state==='suspended')c.resume();const t=c.currentTime,E=1.4,n=c.createGain(),f=c.createBiquadFilter(),l=c.createOscillator(),lg=c.createGain(),lg2=c.createGain();   // dovt, ekande "buuuum": slag på en stor välfylld ballong – låg grundton med mjuk överton, lågpassfilter, långsam darr och ett eko
+    const mk=(type,f0,f1,f2)=>{const o=c.createOscillator();o.type=type;o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(f1,t+.14);o.frequency.exponentialRampToValueAtTime(f2,t+E);return o};
+    const o=mk('triangle',105,175,72),o2=mk('sine',210,350,144);   // grundton + en oktav över (hörbar i små högtalare), båda mjuka vågformer
+    f.type='lowpass';f.frequency.setValueAtTime(650,t);f.frequency.exponentialRampToValueAtTime(240,t+E);f.Q.value=1.5;
+    l.frequency.value=5;lg.gain.setValueAtTime(8,t);lg.gain.linearRampToValueAtTime(2,t+E);lg2.gain.value=2;l.connect(lg);l.connect(lg2);lg.connect(o.frequency);lg2.connect(o2.frequency);
+    const g2=c.createGain();g2.gain.value=.55;o.connect(f);o2.connect(g2);g2.connect(f);f.connect(n);
+    n.gain.setValueAtTime(.0001,t);n.gain.exponentialRampToValueAtTime(.34,t+.04);n.gain.exponentialRampToValueAtTime(.001,t+E);
+    let out=n;if(c.createStereoPanner){const p=c.createStereoPanner();p.pan.value=d>0?-.7:.7;n.connect(p);out=p}
+    out.connect(this.master);
+    const dl=c.createDelay(.5),fb=c.createGain(),wet=c.createGain(),lp=c.createBiquadFilter();dl.delayTime.value=.19;fb.gain.value=.38;wet.gain.value=.45;lp.type='lowpass';lp.frequency.value=380;   // eko: dämpat, återkopplat
+    out.connect(dl);dl.connect(lp);lp.connect(fb);fb.connect(dl);lp.connect(wet);wet.connect(this.master);
+    o.start(t);o2.start(t);l.start(t);o.stop(t+E+.05);o2.stop(t+E+.05);l.stop(t+E+.05)},
+  sfx(k){const s=SFX[k];if(s&&this.ctx)s.forEach(([f,d,ty,v],i)=>this.tone(f,d,ty,v,this.ctx.currentTime+i*.07))}};
+const SFX={ // [REG:SFX] namn:[[frekvens,längd,vågform,volym],...]
+  sel:[[660,.06,'square',.05]],ok:[[523,.07,'square',.05],[784,.1,'square',.05]],hit:[[160,.18,'sawtooth',.07]],shoot:[[880,.05,'square',.035]],ehit:[[300,.07,'square',.05]],kill:[[400,.06,'square',.05],[200,.12,'square',.05]],pick:[[784,.06,'square',.05],[1047,.1,'square',.05]]};
+const mf=s=>{const m=/^([A-G])(#|b)?(\d)$/.exec(s);return 440*2**((12*(+m[3]+1)+{C:0,D:2,E:4,F:5,G:7,A:9,B:11}[m[1]]+(m[2]=='#'?1:m[2]=='b'?-1:0)-69)/12)};
+const TRACKS={ // [REG:TRACKS] bpm, vågform, lead/bass = ett åttondelssteg per token, '-' = paus
+  title:{bpm:90,w:'square',lead:'A4 - C5 E5 A5 - E5 - D5 - F5 A5 G5 - E5 -',bass:'A2 - - - A2 - - - F2 - - - G2 - - -'},
+  world:{bpm:100,w:'triangle',lead:'E4 G4 C5 G4 E4 G4 D5 G4 D4 F4 B4 F4 C4 E4 G4 -',bass:'C3 - - - C3 - - - G2 - - - C3 - - -'},
+  town:{bpm:110,w:'square',lead:'G4 - B4 D5 - B4 G4 - A4 - C5 E5 - C5 A4 -',bass:'G2 - D3 - G2 - D3 - A2 - E3 - A2 - E3 -'},
+  cave:{bpm:70,w:'triangle',lead:'D4 - - F4 - - A3 - - C4 - - - - - -',bass:'D2 - - - - - D2 - - - - - A1 - - -'},
+  ruins:{bpm:120,w:'square',lead:'E4 - G4 - B4 - A4 G4 E4 - G4 - D4 - - -',bass:'E2 - E2 - E2 - E2 - D2 - D2 - D2 - D2 -'},
+  air:{bpm:140,w:'square',lead:'C5 E5 G5 E5 C5 E5 G5 B5 A4 C5 E5 C5 G4 B4 D5 B4',bass:'C3 - C3 - C3 - C3 - A2 - A2 - G2 - G2 -'}};
+const Music={want:null,cur:null,pos:0,next:0,
+  play(n){this.want=n;if(!SND.ctx||this.cur===n)return;this.cur=n;this.pos=0;this.next=SND.ctx.currentTime+.1},
+  start(){const w=this.want;this.cur=null;if(w)this.play(w)},
+  tick(){const c=SND.ctx,T=TRACKS[this.cur];if(!c||!T)return;if(this.next<c.currentTime-.5)this.next=c.currentTime+.1;
+    const L=T.lead.split(' '),B=T.bass.split(' '),st=60/T.bpm/2;
+    while(this.next<c.currentTime+.15){const i=this.pos++,l=L[i%L.length],b=B[i%B.length];
+      if(l!=='-')SND.tone(mf(l),st*.9,T.w,.035,this.next);if(b!=='-')SND.tone(mf(b),st*1.8,'triangle',.06,this.next);this.next+=st}}};
+
+/* ===== [GFX] gemensamma grafikelement (samma figur i alla banor) ===== */
+const GFX={
+  // fötterna står i (x,y). face 0 framifrån, 1 bakifrån, 2/3 sida. ph=gångfas, mvg=rör sig
+  person(x,y,f,ph,mvg,col='#4a90d9',hair='#6a4020'){
+    const s=mvg?Math.sin(ph)*3:0,side=f>1,d=f===3?1:-1;
+    g.fillStyle='rgba(0,0,0,.3)';g.beginPath();g.ellipse(x,y,8,3,0,0,7);g.fill();
+    g.fillStyle='#252535';
+    if(side){g.fillRect(x-3+s,y-9,5,9);g.fillRect(x-3-s,y-9,5,9)}else{g.fillRect(x-6,y-9+s*.5,5,9);g.fillRect(x+1,y-9-s*.5,5,9)}
+    g.fillStyle=col;g.fillRect(side?x-5:x-7,y-23,side?10:14,15);
+    g.fillStyle='#f0c8a0';g.beginPath();g.arc(x,y-29,7,0,7);g.fill();
+    g.fillStyle=hair;g.beginPath();g.arc(x,y-29,7.5,f===1?0:Math.PI,f===1?7:0);g.fill();
+    g.fillStyle='#222';
+    if(f===0){g.fillRect(x-4,y-29,2,2);g.fillRect(x+2,y-29,2,2)}else if(side)g.fillRect(x+d*3,y-29,2,2)},
+  text(s,x,y,col='#fff',size=16,al='left'){g.font=size+'px monospace';g.fillStyle=col;g.textAlign=al;g.fillText(s,x,y)},
+  hud(){const u=heartU(G),n=Math.ceil(hpMax(G)/u),f=Math.min(n,Math.ceil(Math.max(0,G.hp)/u));
+    GFX.text('♥'.repeat(f)+'♡'.repeat(n-f)+'   Guld: '+G.gold,10,22,'#fff',16);
+    GFX.text('Nv '+G.lv+(G.lv<MAXLV?'   EXP '+G.exp+'/'+needExp(G.lv):'   MAX'),10,42,'#ffd870',14);
+    if(clock<FX.until){g.globalAlpha=Math.min(1,FX.until-clock);GFX.text(FX.msg,VW/2,70,'#ffd870',32,'center');g.globalAlpha=1}}};
+const T=32;                                       // tilestorlek för alla kartor
+function blocked(x,y,hw,hh,S){const x0=Math.floor((x-hw)/T),x1=Math.floor((x+hw-.01)/T),y0=Math.floor((y-hh)/T),y1=Math.floor((y+hh-.01)/T);
+  for(let j=y0;j<=y1;j++)for(let i=x0;i<=x1;i++)if(S(i,j))return 1;return 0}
+function mv(p,k,d,hw,hh,S){const s=Math.sign(d);let n=Math.abs(d);while(n>0){const st=Math.min(1,n)*s;p[k]+=st;if(blocked(p.x,p.y,hw,hh,S)){p[k]-=st;return 1}n--}return 0}
+function tdMove(dt,sp,S,hw,hh){                   // gemensam ovanifrånrörelse (karta, stad, grotta)
+  const ax=axis('left','right'),ay=axis('up','down');P.mv=ax||ay;
+  if(P.mv){const l=Math.hypot(ax,ay);mv(P,'x',ax/l*sp*dt,hw,hh,S);mv(P,'y',ay/l*sp*dt,hw,hh,S);P.face=ay?(ay>0?0:1):(ax<0?2:3);P.ph+=dt*sp/10}}
+
+/* ===== [UI] dialogrutor och menyer (modala: scenen står still medan de är öppna) ===== */
+const UI={cur:null,
+  dialog(lines,done){this.cur={k:'d',lines,i:0,done}},                 // UI.dialog(['rad1','rad2'],()=>...)
+  menu(title,opts,cb){this.cur={k:'m',title,opts,i:0,cb}},             // cb(index) – -1 vid Esc/X
+  update(){const c=this.cur,ok=A.hit('confirm')||A.hit('pause');
+    if(c.k==='d'){if(ok||M.click){SND.sfx('sel');if(++c.i>=c.lines.length){this.cur=null;c.done&&c.done()}}}
+    else{const n=c.opts.length;if(A.hit('up'))c.i=(c.i+n-1)%n;if(A.hit('down'))c.i=(c.i+1)%n;
+      let pick=-1;if(M.moved||M.click){const b=this.box(c),i=Math.floor((M.y-(b.y+11+(c.title?28:0)))/28);   // mus: peka = markera, klick = välj (bara när menyn är öppen)
+        if(i>=0&&i<n&&M.x>=b.x&&M.x<=b.x+b.mw){if(M.click)pick=i;else if(c.i!==i){c.i=i;SND.sfx('sel')}}}
+      if(pick>=0){SND.sfx('sel');this.cur=null;c.cb(pick)}
+      else if(ok){SND.sfx('sel');this.cur=null;c.cb(c.i)}else if(A.hit('cancel')){this.cur=null;c.cb(-1)}}},
+  box(c){g.font='16px monospace';const rows=c.title?[c.title,...c.opts]:c.opts,mw=Math.max(...rows.map(r=>g.measureText(r).width))+70,h=rows.length*28+20;return{x:(VW-mw)/2,y:(VH-h)/2,mw,h}},
+  wrap(s,w){const out=[];let l='';for(const o of s.split(' ')){if(g.measureText(l+o).width>w&&l){out.push(l);l=''}l+=o+' '}out.push(l);return out},
+  panel(txt,more,hint){g.font='16px monospace';g.textAlign='left';const x=16,y=VH-112,w=VW-32;g.fillStyle='rgba(10,10,30,.92)';g.fillRect(x,y,w,96);g.strokeStyle='#fff';g.strokeRect(x+.5,y+.5,w,96);   // dialogruta (även icke-modal)
+    this.wrap(txt,w-28).forEach((l,i)=>GFX.text(l,x+14,y+28+i*22));
+    if(hint)GFX.text(hint,x+14,y+86,'#ffd870',13);if(more&&clock%1<.6)GFX.text('▼',x+w-24,y+84)},
+  draw(){const c=this.cur;g.font='16px monospace';g.textAlign='left';
+    if(c.k==='d')this.panel(c.lines[c.i],1)
+    else{const{x,y,mw,h}=this.box(c);
+      g.fillStyle='rgba(10,10,30,.94)';g.fillRect(x,y,mw,h);g.strokeStyle='#fff';g.strokeRect(x+.5,y+.5,mw,h);
+      if(c.title)GFX.text(c.title,VW/2,y+30,'#ffd870',16,'center');
+      c.opts.forEach((o,i)=>{const yy=y+30+(c.title?28:0)+i*28;GFX.text((i===c.i?'▶ ':'  ')+o,x+20,yy,i===c.i?'#fff':'#9a9ab0')})}}};
+
+/* ===== [REG:BLOCKS] blocktyper. s=1 solid. d(px,py,tx,ty) ritar. Lägg till nya rader här ===== */
+const fillT=(c)=>(x,y)=>{g.fillStyle=c;g.fillRect(x,y,T,T)};
+const spec=(x,y,tx,ty,c)=>{if((tx*7+ty*13)%5===0){g.fillStyle=c;g.fillRect(x+8,y+10,3,3)}};
+const BLOCKS={
+  grass:{s:0,d(x,y,tx,ty){fillT('#3d7d38')(x,y);spec(x,y,tx,ty,'#4f9448')}},
+  sand:{s:0,d(x,y,tx,ty){fillT('#cdb272')(x,y);spec(x,y,tx,ty,'#b99c5c')}},
+  tree:{s:1,d(x,y,tx,ty){BLOCKS.grass.d(x,y,tx,ty);g.fillStyle='#5a3a1c';g.fillRect(x+13,y+18,6,12);g.fillStyle='#1f5a22';g.beginPath();g.arc(x+16,y+13,12,0,7);g.fill();g.fillStyle='#2b7a2e';g.beginPath();g.arc(x+12,y+10,6,0,7);g.fill()}},
+  rock:{s:1,d(x,y,tx,ty){BLOCKS.grass.d(x,y,tx,ty);g.fillStyle='#6a707a';g.beginPath();g.moveTo(x+3,y+28);g.lineTo(x+8,y+8);g.lineTo(x+18,y+3);g.lineTo(x+29,y+14);g.lineTo(x+28,y+28);g.fill();g.fillStyle='#8c939e';g.fillRect(x+10,y+9,8,4)}},
+  water:{s:1,d(x,y){fillT('#2a5fa8')(x,y);g.strokeStyle='#4a82c8';g.lineWidth=1;g.beginPath();const o=Math.sin(clock*2+x*.05)*3;g.moveTo(x+4,y+16+o);g.quadraticCurveTo(x+10,y+11+o,x+16,y+16+o);g.quadraticCurveTo(x+22,y+21+o,x+28,y+16+o);g.stroke()}},
+  portal:{s:0,d(x,y,tx,ty){BLOCKS.sand.d(x,y,tx,ty);const d=PORTALS[WORLD.pt[tx+','+ty]],r=11+Math.sin(clock*4)*2;
+    g.strokeStyle=d.c;g.lineWidth=3;g.beginPath();g.arc(x+16,y+16,r,0,7);g.stroke();GFX.text(d.ch,x+16,y+22,d.c,16,'center')}},
+  floor:{s:0,d(x,y,tx,ty){fillT((tx+ty)%2?'#7a6a58':'#756552')(x,y)}},
+  wall:{s:1,d(x,y,tx,ty){fillT('#8a4a3a')(x,y);g.fillStyle='#6a362a';g.fillRect(x,y+15,T,2);g.fillRect(x+(ty%2?8:20),y,2,15);g.fillRect(x+(ty%2?20:8),y+17,2,15)}},
+  cfloor:{s:0,d(x,y,tx,ty){fillT((tx+ty)%2?'#3a3646':'#363242')(x,y)}},
+  cwall:{s:1,d(x,y,tx,ty){fillT('#1c1a24')(x,y);g.fillStyle='#2a2736';g.fillRect(x+4+(tx*5%9),y+6,10,8)}},
+  gate:{s:0,d(x,y){fillT('#2a2010')(x,y);g.fillStyle='#e8c050';g.fillRect(x,y,T,3)}},
+  crate:{s:1,d(x,y,tx,ty){BLOCKS.floor.d(x,y,tx,ty);g.fillStyle='#8a6a30';g.fillRect(x+4,y+4,24,24);g.strokeStyle='#5a4420';g.strokeRect(x+4.5,y+4.5,23,23)}},
+  ccrate:{s:1,d(x,y,tx,ty){BLOCKS.cfloor.d(x,y,tx,ty);g.fillStyle='#55506a';g.beginPath();g.arc(x+16,y+18,11,0,7);g.fill()}},
+  rblock:{s:1,d(x,y){fillT('#7a7468')(x,y);g.strokeStyle='#4a463e';g.strokeRect(x+.5,y+.5,T-1,T-1)}}};
+
+/* ===== [REG:PORTALS] portaltyper på världskartan (en av varje i teststadiet) ===== */
+const PORTALS={town:{ch:'S',c:'#e8c050',q:'Besöka staden?',scene:'town'},cave:{ch:'G',c:'#b080ff',q:'Besöka grottan?',scene:'cave'},
+  ruins:{ch:'R',c:'#e08060',q:'Besöka ruinstaden?',scene:'ruins'},airfield:{ch:'F',c:'#70d0ff',q:'Besöka flygplatsen?',scene:'airfield'}};
+
+/* ===== [REG:NPCS] byinvånare: lines = dialog, shop = öppnar handelsmenyn ===== */
+const NPCS={elder:{c:'#b0a0d0',lines:['Välkommen, resenär.','Stadsmuren har stått längre än någon minns.']},
+  trader:{c:'#d0a040',shop:1,lines:['Varor? Hyllorna är tomma än så länge.']},
+  villager:{c:'#70b070',lines:['De säger att grottan har en boss längst in.','Flygplatsen ligger långt från ruinerna.']}};
+/* ===== [REG:ENEMIES] fiender (ai körs varje steg; S = kollisionsfunktion) ===== */
+// bas-stats vid zonnivå 1: hp, atk (anfallsvärde), df (försvar), exp. Skalas med zoneF(zonnivå) vid varje besök. wt = tyngd (knuffas om spelarens str ≥ wt). hw = halv hitbox
+const ENEMIES={
+  blob:{c:'#9a3ac8',sp:40,atk:10,df:0,hp:20,exp:3,wt:1,hw:8,drop:.3,ai(e,dt,S){if((e.t-=dt)<=0){const a=Math.random()*6.28;e.vx=Math.cos(a);e.vy=Math.sin(a);e.t=.5+Math.random()}
+    if(mv(e,'x',e.vx*this.sp*dt,8,8,S)){e.vx*=-1}if(mv(e,'y',e.vy*this.sp*dt,8,8,S)){e.vy*=-1}},
+    draw(e){g.fillStyle=this.c;g.beginPath();g.ellipse(e.x,e.y+3,10,8+Math.sin(clock*6+e.x)*1.5,0,0,7);g.fill();g.fillStyle='#fff';g.fillRect(e.x-4,e.y,3,3);g.fillRect(e.x+2,e.y,3,3)}},
+  brute:{c:'#a03030',sp:26,atk:14,df:6,hp:60,exp:8,wt:3,hw:11,drop:.5,ai(e,dt,S){const d=Math.hypot(P.x-e.x,P.y-e.y);   // tung: långsam, jagar när spelaren är nära, knuffas inte
+      if(d<170){e.vx=(P.x-e.x)/d;e.vy=(P.y-e.y)/d}else if((e.t-=dt)<=0){const a=Math.random()*6.28;e.vx=Math.cos(a)*.6;e.vy=Math.sin(a)*.6;e.t=1+Math.random()}
+      mv(e,'x',e.vx*this.sp*dt,11,11,S);mv(e,'y',e.vy*this.sp*dt,11,11,S)},
+    draw(e){g.fillStyle='rgba(0,0,0,.3)';g.beginPath();g.ellipse(e.x,e.y+11,13,4,0,0,7);g.fill();g.fillStyle=this.c;g.fillRect(e.x-13,e.y-10,26,24);g.fillStyle='#702020';g.fillRect(e.x-13,e.y+6,26,8);
+      g.fillStyle='#e8e0c0';g.beginPath();g.moveTo(e.x-12,e.y-10);g.lineTo(e.x-16,e.y-20);g.lineTo(e.x-6,e.y-10);g.fill();g.beginPath();g.moveTo(e.x+12,e.y-10);g.lineTo(e.x+16,e.y-20);g.lineTo(e.x+6,e.y-10);g.fill();
+      g.fillStyle='#ffd040';g.fillRect(e.x-7,e.y-3,4,4);g.fillRect(e.x+3,e.y-3,4,4)}},
+  shooter:{c:'#3a9ac8',sp:34,atk:12,df:0,hp:18,exp:5,wt:1,hw:8,drop:.4,ai(e,dt,S,X){const dx=P.x-e.x,dy=P.y-e.y,d=Math.hypot(dx,dy)||1;   // håller avstånd och skjuter långsamma projektiler
+      const dir=d<110?-1:d>200?1:0;if(dir){mv(e,'x',dir*dx/d*this.sp*dt,8,8,S);mv(e,'y',dir*dy/d*this.sp*dt,8,8,S)}
+      else{mv(e,'x',-dy/d*this.sp*.6*dt,8,8,S);mv(e,'y',dx/d*this.sp*.6*dt,8,8,S)}
+      if((e.cd-=dt)<=0&&d<280){e.cd=1.8+Math.random()*.6;X.fire(e,dx/d*120,dy/d*120)}},
+    draw(e){g.fillStyle=this.c;g.beginPath();g.moveTo(e.x,e.y-12);g.lineTo(e.x+10,e.y+8);g.lineTo(e.x-10,e.y+8);g.closePath();g.fill();g.fillStyle='#fff';g.fillRect(e.x-4,e.y-1,3,3);g.fillRect(e.x+2,e.y-1,3,3);
+      g.fillStyle='#ff9040';g.beginPath();g.arc(e.x,e.y-14+Math.sin(clock*8)*1.5,3,0,7);g.fill()}}};
+
+// ---- ruinstadens originalfiender (sidovy). hh = halv hitboxhöjd, ai(e,dt,W): W.S = kollision, W.fire(e,vx,vy,g) = skjut. Positioner är världskoordinater, e.x/e.y = mittpunkt
+Object.assign(ENEMIES,{
+  fladdrare:{c:'#6a4a9a',sp:70,atk:9,df:0,hp:14,exp:4,wt:1,hw:10,hh:8,drop:.3,ai(e,dt){e.t+=dt;const dx=P.x-e.x;if(Math.abs(dx)<320)e.d=dx>0?1:-1;   // flyger i vågform mot spelaren, genom väggar
+      e.x+=e.d*this.sp*dt;e.y=e.y0+Math.sin(e.t*3.2)*38},
+    draw(e){const w=Math.sin(clock*14+e.t)*7;g.fillStyle='#9a7ad0';g.beginPath();g.moveTo(e.x,e.y);g.lineTo(e.x-16,e.y-6-w);g.lineTo(e.x-6,e.y+4);g.fill();g.beginPath();g.moveTo(e.x,e.y);g.lineTo(e.x+16,e.y-6-w);g.lineTo(e.x+6,e.y+4);g.fill();
+      g.fillStyle=this.c;g.beginPath();g.ellipse(e.x,e.y,7,8,0,0,7);g.fill();g.fillStyle='#ffe060';g.fillRect(e.x-4,e.y-2,3,3);g.fillRect(e.x+1,e.y-2,3,3)}},
+  stenvakt:{c:'#8a8070',sp:40,atk:14,df:5,hp:50,exp:9,wt:3,hw:12,hh:20,drop:.5,ai(e,dt,W){const S=W.S;e.vy+=1200*dt;if(mv(e,'y',e.vy*dt,this.hw,this.hh,S))e.vy=0;   // går fram och tillbaka, vänder vid vägg och kant, knuffas inte
+      if(mv(e,'x',e.d*this.sp*dt,this.hw,this.hh,S)||!blocked(e.x+e.d*(this.hw+3),e.y+this.hh+3,1,2,S))e.d*=-1},
+    draw(e){const s=Math.sin(e.x*.15)*2;g.fillStyle='rgba(0,0,0,.3)';g.beginPath();g.ellipse(e.x,e.y+20,13,3,0,0,7);g.fill();g.fillStyle='#5a5448';g.fillRect(e.x-9,e.y+8,7,12+s*.3);g.fillRect(e.x+2,e.y+8,7,12-s*.3);
+      g.fillStyle=this.c;g.fillRect(e.x-12,e.y-12,24,22);g.fillStyle='#a89e8a';g.fillRect(e.x-12,e.y-12,24,4);g.fillStyle='#6a6254';g.beginPath();g.moveTo(e.x-10,e.y-12);g.lineTo(e.x,e.y-22);g.lineTo(e.x+10,e.y-12);g.fill();
+      g.fillStyle='#ff6030';g.fillRect(e.x+e.d*4-2,e.y-6,4,4);g.fillRect(e.x+e.d*10-2,e.y-6,3,4)}},
+  eldspott:{c:'#4a3a3a',sp:0,atk:12,df:2,hp:20,exp:6,wt:2,hw:10,hh:12,drop:.4,ai(e,dt,W){const dx=P.x-e.x;e.d=dx>0?1:-1;   // stillastående kruka som kastar glöd i båge mot spelaren
+      if(Math.abs(dx)<340&&Math.abs(dx)>40&&(e.cd-=dt)<=0){e.cd=2+Math.random()*.7;const T0=.9,gr=520;W.fire(e,Math.max(-220,Math.min(220,dx/T0)),(P.y-e.y-.5*gr*T0*T0)/T0,gr)}},
+    draw(e){g.fillStyle=this.c;g.beginPath();g.moveTo(e.x-10,e.y-4);g.lineTo(e.x+10,e.y-4);g.lineTo(e.x+7,e.y+12);g.lineTo(e.x-7,e.y+12);g.fill();g.fillStyle='#2a2020';g.fillRect(e.x-11,e.y-7,22,4);
+      const f=Math.sin(clock*12+e.x)*2;g.fillStyle='#ff9030';g.beginPath();g.moveTo(e.x-6,e.y-7);g.lineTo(e.x,e.y-17-f);g.lineTo(e.x+6,e.y-7);g.fill();g.fillStyle='#ffe070';g.beginPath();g.moveTo(e.x-3,e.y-7);g.lineTo(e.x,e.y-13-f*.5);g.lineTo(e.x+3,e.y-7);g.fill()}}});
+
+/* ===== [SCENE:TITLE] startskärm ===== */
+SCENES.title={w:960,h:540,music:'title',stars:[],open:0,
+  enter(){const r=mulberry32(7);this.stars=Array.from({length:90},()=>[r()*960,r()*540,r()*2+1]);this.open=0},
+  update(){if(!this.open){this.open=1;const o=[['Starta nytt spel',()=>{newGame();go('world')}]];if(autoRaw())o.push(['Fortsätt (autospar)',()=>loadText(autoRaw())]);o.push(['Ladda från fil',pickFile]);
+    UI.menu('',o.map(x=>x[0]),i=>{this.open=0;
+    if(i>=0)o[i][1]()})}},
+  draw(){g.fillStyle='#10102a';g.fillRect(0,0,VW,VH);g.fillStyle='#fff';this.stars.forEach(([x,y,s])=>g.fillRect(x,y+Math.sin(clock+x)*2,s,s));
+    GFX.text('NAMNLÖST SPEL',VW/2,150,'#ffd870',56,'center');GFX.text('mallstruktur, fas 1c (strid i grotta och ruinstad)',VW/2,185,'#9a9ab0',18,'center');
+    GFX.text('Pilar/WASD gå · Mellanslag/Z välj · Enter paus · M ljud av/på',VW/2,VH-24,'#707090',14,'center')}};
+
+/* ===== [SCENE:WORLD] världskarta (genereras ur seed; WORLD är härledd data, inte sparad) ===== */
+const WW=60,WH=40,DIR4=[[1,0],[-1,0],[0,1],[0,-1]];let WORLD=null;
+function genWorld(){const r=rngFor('world'),m=[];
+  const noise=sz=>{const gw=Math.ceil(WW/sz)+2,gh=Math.ceil(WH/sz)+2,v=Array.from({length:gh},()=>Array.from({length:gw},()=>r())),sm=t=>t*t*(3-2*t);
+    return(x,y)=>{const fx=x/sz,fy=y/sz,ix=fx|0,iy=fy|0,sx=sm(fx-ix),sy=sm(fy-iy),a=v[iy][ix],b=v[iy][ix+1],c=v[iy+1][ix],d=v[iy+1][ix+1];
+      return a+(b-a)*sx+(c-a)*sy+(a-b-c+d)*sx*sy}};
+  const E=noise(9),F=noise(4);
+  for(let y=0;y<WH;y++){m[y]=[];for(let x=0;x<WW;x++){const ed=Math.min(x,y,WW-1-x,WH-1-y),h=E(x,y)+.15-(ed<5?(5-ed)*.14:0),f=F(x,y);
+    m[y][x]=h<.36?'water':h<.41?'sand':h>.74?'rock':f>.64?'tree':'grass'}}
+  const S=(x,y)=>x<0||y<0||x>=WW||y>=WH||BLOCKS[m[y][x]].s,seen=new Uint8Array(WW*WH);let best=[];
+  for(let y=0;y<WH;y++)for(let x=0;x<WW;x++){if(seen[y*WW+x]||S(x,y))continue;const q=[[x,y]];seen[y*WW+x]=1;   // störst sammanhängande landyta
+    for(let i=0;i<q.length;i++)for(const[dx,dy]of DIR4){const nx=q[i][0]+dx,ny=q[i][1]+dy;if(!S(nx,ny)&&!seen[ny*WW+nx]){seen[ny*WW+nx]=1;q.push([nx,ny])}}
+    if(q.length>best.length)best=q}
+  const dc=([x,y])=>Math.hypot(x-WW/2,y-WH/2),start=best.reduce((a,b)=>dc(a)<dc(b)?a:b);
+  const cand=best.filter(([x,y])=>m[y][x]==='grass'||m[y][x]==='sand').map(([x,y])=>({x,y}));
+  const portals=[],pt={},all=[{x:start[0],y:start[1]}];                                                       // portaler: alltid nåbara
+  for(const type in PORTALS){let sp=18,list;do{list=cand.filter(c=>all.every(q=>Math.hypot(q.x-c.x,q.y-c.y)>=sp));sp-=2}while(!list.length&&sp>0);
+    const c=list[Math.floor(r()*list.length)]||cand[0];all.push(c);portals.push({id:c.x+','+c.y,type,x:c.x,y:c.y});m[c.y][c.x]='portal'}
+  return{m,start,portals}}
+GEN.world=()=>encodeWorld(genWorld());
+SCENES.world={w:960,h:540,music:'world',cx:0,cy:0,
+  S:(i,j)=>i<0||j<0||i>=WW||j>=WH||BLOCKS[WORLD.m[j][i]].s,
+  enter(){if(!WORLD)WORLD=decodeWorld(G.maps.world);const p=G.lastPortal&&WORLD.portals.find(q=>q.id===G.lastPortal),s=p?[p.x,p.y]:WORLD.start;
+    P.x=s[0]*T+16;P.y=s[1]*T+16;P.face=0;P.mv=0;if(p)G.skip=p.x+','+p.y},      // man står på portalen man kom ut ur
+  update(dt){tdMove(dt,130,this.S,8,8);const tx=P.x/T|0,ty=P.y/T|0,k=tx+','+ty,pt=WORLD.pt[k];
+    if(!pt)G.skip=null;else if(G.skip!==k){G.skip=k;const d=PORTALS[pt];const zl=G.maps[d.scene]&&G.maps[d.scene].lvl;UI.menu(d.q+(zl?'  (nivå '+zl+')':''),['Ja','Nej'],i=>{if(i===0){G.lastPortal=k;SND.sfx('ok');go(d.scene)}})}},
+  draw(){const cx=Math.max(0,Math.min(WW*T-VW,P.x-VW/2)),cy=Math.max(0,Math.min(WH*T-VH,P.y-VH/2));
+    for(let y=cy/T|0;y<=(cy+VH)/T;y++)for(let x=cx/T|0;x<=(cx+VW)/T;x++)if(WORLD.m[y]&&WORLD.m[y][x])BLOCKS[WORLD.m[y][x]].d(x*T-cx,y*T-cy,x,y);
+    GFX.person(P.x-cx,P.y+8-cy,P.face,P.ph,P.mv);GFX.hud()}};
+
+/* ===== [SCENE:ROOM] stad + grotta delar rumsmotor (ovanifrånvy, 16x12 rutor). Nya rumstyper: makeRoom('id',{...}) ===== */
+const RW=16,RH=12;
+function genRoom(id,cfg){const r=rngFor(id),npcs=[],map=Array.from({length:RH},(_,y)=>Array.from({length:RW},(_,x)=>x*y===0||x===RW-1||y===RH-1?cfg.wall:cfg.floor));
+  map[RH-1][7]=map[RH-1][8]='gate';
+  const free=[];for(let y=1;y<RH-4;y++)for(let x=1;x<RW-1;x++)free.push([x,y]);                // fria platser (ej närmast porten)
+  const take=()=>free.splice(Math.floor(r()*free.length),1)[0];
+  for(let i=0;i<8;i++){const[x,y]=take();map[y][x]=cfg.crate}
+  (cfg.npcs||[]).forEach(k=>{const[x,y]=take();npcs.push({k,tx:x,ty:y})});
+  return{rows:enc(map),npcs,lvl:cfg.lvl}}                                                                // layout + NPC-platser sparas; fiender återskapas i enter()
+function makeRoom(id,cfg){let map,npcs,en,inv,aim,sh,pr,pk,ep,fl,talk,lvl;GEN[id]=()=>genRoom(id,cfg);   // aim=sikte, sh=skottpaus, pr=spelarens projektiler, ep=fiendens projektiler, pk=hjärtdroppar, fl=flytande skadetal, talk=pågående samtal
+  const num=(x,y,n,c)=>fl.push({x,y,n,c,t:.8});
+  const takeHit=atk=>{const d=dealt(atk,stats(G).def);G.hp-=d;inv=1;SND.sfx('hit');num(P.x,P.y-30,d,'#ff6080')};
+  const hurt=(e,b)=>{const E=ENEMIES[e.k],s=stats(G),d=dealt(s.atk,e.df);e.hp-=d;e.hurt=.3;SND.sfx('ehit');num(e.x,e.y-16,d,'#fff');
+    if(s.str>=E.wt){const l=Math.hypot(b.vx,b.vy);e.kx=b.vx/l*220;e.ky=b.vy/l*220}                 // lätta fiender knuffas, tunga står kvar
+    if(e.hp<=0){e.dead=1;SND.sfx('kill');gainExp(zoneExp(E.exp,lvl));if(Math.random()<E.drop)pk.push({x:e.x,y:e.y})}};
+  const S=(i,j)=>i<0||j<0||i>=RW||j>=RH||BLOCKS[map[j][i]].s||npcs.some(n=>n.tx===i&&n.ty===j);
+  const X={fire:(e,vx,vy)=>ep.push({x:e.x,y:e.y,vx,vy,atk:e.atk})};
+  const nearNpc=r=>npcs.find(n=>Math.hypot(n.tx*T+16-P.x,n.ty*T+16-P.y)<r);
+  const lines=()=>NPCS[talk.n.k].lines,more=()=>talk.i<lines().length-1;
+  const trade=()=>{SND.sfx('sel');UI.menu('Handel',['(inga varor ännu)','Avsluta handel'],()=>{})};   // upp/ned väljer i menyn; lämna med Esc/X, "Avsluta handel" eller klick
+  SCENES[id]={w:RW*T,h:RH*T,music:cfg.music,
+    click(){if(!talk||M.y<VH-112||M.y>VH-16)return 0;            // klick på dialogrutan: nästa rad, eller (på sista raden hos handlaren) öppna handel
+      if(more()){talk.i++;SND.sfx('sel')}else if(NPCS[talk.n.k].shop)trade();return 1},
+    enter(){const d=G.maps[id];inv=0;en=[];pr=[];ep=[];pk=[];fl=[];talk=null;sh=0;aim=[0,-1];lvl=d.lvl||1;map=dec(d.rows);npcs=d.npcs.map(n=>({...n}));
+      const free=[];for(let y=1;y<RH-4;y++)for(let x=1;x<RW-1;x++)if(map[y][x]===cfg.floor&&!npcs.some(n=>n.tx===x&&n.ty===y))free.push([x,y]);   // fria golvrutor; fiender slumpas färskt vid varje besök
+      const f=zoneF(lvl);for(const k in cfg.enemies||{})for(let i=0;i<cfg.enemies[k]&&free.length;i++){const[x,y]=free.splice(Math.random()*free.length|0,1)[0],E=ENEMIES[k],hp=Math.round(E.hp*f);
+        en.push({k,x:x*T+16,y:y*T+16,t:0,vx:0,vy:0,hp,atk:Math.round(E.atk*f),df:Math.round(E.df*f),cd:1+Math.random()*2,hurt:0,kx:0,ky:0})}   // [TODO:BOSS] bossplats i grottan
+      P.x=8*T;P.y=(RH-2)*T+16;P.face=1;P.mv=0},
+    update(dt){
+      // samtal: öppnas vid beröring, stängs när man går ifrån. Pil ned = nästa rad (spelaren står still medan fler rader finns)
+      if(talk){if(Math.hypot(talk.n.tx*T+16-P.x,talk.n.ty*T+16-P.y)>56)talk=null}
+      else{const n=nearNpc(42);if(n){talk={n,i:0};SND.sfx('sel')}}
+      let lock=0;if(talk){const d=NPCS[talk.n.k];
+        if(more()&&(A.hit('down')||A.hit('confirm'))){if(A.hit('down'))talk.hold=1;talk.i++;SND.sfx('sel')}
+        else if(!more()&&d.shop&&A.hit('confirm'))trade()
+        if(!A.down('down'))talk.hold=0;lock=A.down('down')&&(more()||talk.hold)?1:0}
+      if(lock)P.mv=0;else tdMove(dt,120,S,7,7);
+      if(map[P.y/T|0][P.x/T|0]==='gate')return go('world');
+      inv-=dt;const ax=axis('left','right'),ay=axis('up','down');if(!lock&&(ax||ay)){const l=Math.hypot(ax,ay);aim=[ax/l,ay/l]}   // sikte i 8 riktningar
+      sh-=dt;if(!cfg.peace&&!talk&&A.down('confirm')&&sh<=0){sh=.3;pr.push({x:P.x,y:P.y,vx:aim[0]*260,vy:aim[1]*260});SND.sfx('shoot')}   // autofire vid hållen knapp, ej i fredliga rum
+      for(const b of pr){b.x+=b.vx*dt;b.y+=b.vy*dt;if(blocked(b.x,b.y,2,2,S)){b.dead=1;continue}
+        for(const e of en)if(!e.dead&&Math.hypot(e.x-b.x,e.y-b.y)<ENEMIES[e.k].hw+4){b.dead=1;hurt(e,b);break}}
+      for(const b of ep){b.x+=b.vx*dt;b.y+=b.vy*dt;if(blocked(b.x,b.y,2,2,S)){b.dead=1;continue}
+        if(inv<=0&&Math.hypot(b.x-P.x,b.y-P.y)<10){b.dead=1;takeHit(b.atk)}}
+      pr=pr.filter(b=>!b.dead);ep=ep.filter(b=>!b.dead);en=en.filter(e=>!e.dead);
+      for(const p of pk)if(G.hp<hpMax(G)&&Math.hypot(p.x-P.x,p.y-P.y)<16){p.dead=1;G.hp=Math.min(hpMax(G),G.hp+heartU(G));SND.sfx('pick')}   // hjärtdropp ger ett hjärtas värde
+      pk=pk.filter(p=>!p.dead);
+      for(const e of en){const E=ENEMIES[e.k];if(e.hurt>0)e.hurt-=dt;
+        if(e.kx||e.ky){mv(e,'x',e.kx*dt,E.hw,E.hw,S);mv(e,'y',e.ky*dt,E.hw,E.hw,S);e.kx*=.001**dt;e.ky*=.001**dt;if(Math.hypot(e.kx,e.ky)<10)e.kx=e.ky=0}else E.ai(e,dt,S,X);
+        if(inv<=0&&Math.hypot(e.x-P.x,e.y-P.y)<E.hw+8)takeHit(e.atk)}
+      for(const f of fl){f.t-=dt;f.y-=20*dt}fl=fl.filter(f=>f.t>0);
+      if(G.hp<=0){G.hp=hpMax(G);UI.dialog(['Du svimmade och bars tillbaka till kartan.'],()=>go('world'))}},
+    draw(){for(let y=0;y<RH;y++)for(let x=0;x<RW;x++)BLOCKS[map[y][x]].d(x*T,y*T,x,y);
+      const L=[...npcs.map(n=>({y:n.ty*T+28,d:()=>GFX.person(n.tx*T+16,n.ty*T+28,0,0,0,NPCS[n.k].c,'#ddd')})),...en.map(e=>({y:e.y,d:()=>{if(!(e.hurt>0&&(e.hurt*20|0)%2))ENEMIES[e.k].draw(e)}})),...pk.map(p=>({y:p.y,d:()=>GFX.text('♥',p.x,p.y+5+Math.sin(clock*5)*2,'#ff5070',16,'center')})),
+        {y:P.y+8,d:()=>{if(inv<=0||clock*10%2<1)GFX.person(P.x,P.y+8,P.face,P.ph,P.mv)}}].sort((a,b)=>a.y-b.y);L.forEach(o=>o.d());
+      pr.forEach(b=>{g.fillStyle='rgba(255,255,255,.3)';g.beginPath();g.arc(b.x,b.y,7,0,7);g.fill();g.fillStyle='#fff';g.beginPath();g.arc(b.x,b.y,4,0,7);g.fill()});
+      ep.forEach(b=>{g.fillStyle='rgba(255,140,50,.35)';g.beginPath();g.arc(b.x,b.y,7,0,7);g.fill();g.fillStyle='#ffb050';g.beginPath();g.arc(b.x,b.y,4,0,7);g.fill()});
+      fl.forEach(f=>{g.globalAlpha=Math.min(1,f.t*2);GFX.text(''+f.n,f.x,f.y,f.c,14,'center');g.globalAlpha=1});
+      GFX.hud();if(talk&&!UI.cur)UI.panel(lines()[talk.i],more(),!more()&&NPCS[talk.n.k].shop?'[Space/Z eller klick] Handel':'')}}}
+makeRoom('town',{peace:1,music:'town',wall:'wall',floor:'floor',crate:'crate',npcs:['elder','trader','villager']});   /* [SCENE:TOWN] */
+makeRoom('cave',{music:'cave',wall:'cwall',floor:'cfloor',crate:'ccrate',lvl:1,enemies:{blob:3,brute:1,shooter:2}});   // lvl = zonnivå (visas vid porten, skalar fienderna)                       /* [SCENE:CAVE] */
+
+/* ===== [SCENE:RUINS] sidscroll med strid: hopp (upp/W) + magi åt höger/vänster (Space/Z) i Mega Man-stil. Mål till höger, ut åt vänster ===== */
+(()=>{const LEN=140,GJ=14;let h,done,en,pr,ep,pk,fl,inv,sh,lvl,ft;
+  GEN.ruins=()=>{const r=rngFor('ruins'),h=new Array(LEN).fill(0);for(let i=10;i<LEN-8;i++)if(r()<.3){const w=1+(r()*2|0),hh=1+(r()*3|0);for(let k=0;k<w;k++)h[i+k]=hh;i+=w+2}return{h,lvl:1}};   // lvl = zonnivå
+  const S=(i,j)=>i>=LEN||j>=GJ||(i>=0&&h[i]>0&&j>=GJ-h[i]);
+  const num=(x,y,n,c)=>fl.push({x,y,n,c,t:.8});
+  const takeHit=atk=>{const d=dealt(atk,stats(G).def);G.hp-=d;inv=1.2;SND.sfx('hit');num(P.x,P.y-30,d,'#ff6080')};
+  const hurt=(e,b)=>{const E=ENEMIES[e.k],s=stats(G),d=dealt(s.atk,e.df);e.hp-=d;e.hurt=.3;SND.sfx('ehit');num(e.x,e.y-E.hh-6,d,'#fff');
+    if(s.str>=E.wt)e.kx=(b.vx>0?1:-1)*160;
+    if(e.hp<=0){e.dead=1;SND.sfx('kill');gainExp(zoneExp(E.exp,lvl));if(Math.random()<E.drop)pk.push({x:e.x,y:e.y,vy:0})}};
+  const W={S,fire:(e,vx,vy,gr)=>ep.push({x:e.x,y:e.y-6,vx,vy,g:gr,atk:e.atk})};
+  const flat=i=>{for(let c=i;c<Math.min(LEN-6,i+8);c++)if(!h[c-1]&&!h[c]&&!h[c+1])return c;return -1},pill=i=>{for(let c=i;c<Math.min(LEN-6,i+10);c++)if(h[c]>0)return c;return -1};
+  function spawn(){en=[];const f=zoneF(lvl),ty=['fladdrare','fladdrare','stenvakt','stenvakt','eldspott'];   // fiender slumpas färskt vid varje besök (grinding)
+    for(let i=14;i<LEN-8;i+=5+(Math.random()*6|0)){const k=ty[Math.random()*ty.length|0],E=ENEMIES[k];let x,y;
+      if(k==='fladdrare'){x=i*T+16;y=GJ*T-70-Math.random()*150}
+      else if(k==='stenvakt'){const c=flat(i);if(c<0)continue;x=c*T+16;y=GJ*T-E.hh-1}
+      else{const c=pill(i);if(c>=0){x=c*T+16;y=(GJ-h[c])*T-E.hh-1}else{const c2=flat(i);if(c2<0)continue;x=c2*T+16;y=GJ*T-E.hh-1}}
+      en.push({k,x,y,y0:y,t:Math.random()*6,d:Math.random()<.5?-1:1,vy:0,kx:0,hurt:0,cd:1+Math.random()*2,hp:Math.round(E.hp*f),atk:Math.round(E.atk*f),df:Math.round(E.df*f)})}}
+  SCENES.ruins={w:960,h:540,music:'ruins',
+    enter(){h=G.maps.ruins.h;lvl=G.maps.ruins.lvl||1;done=0;inv=0;sh=0;ft=0;pr=[];ep=[];pk=[];fl=[];spawn();
+      P.x=90;P.y=GJ*T-22;P.vy=0;P.face=3},
+    update(dt){ft+=dt;inv-=dt;sh-=dt;const ax=axis('left','right');P.mv=ax;if(ax){P.face=ax<0?2:3;P.ph+=dt*26}
+      mv(P,'x',ax*200*dt,8,22,S);const gnd=blocked(P.x,P.y+1,8,22,S);
+      if(gnd&&A.hit('up'))P.vy=-640;if(!A.down('up')&&P.vy<-220)P.vy=-220;                    // kort tryck = lågt hopp, håll = högt hopp
+      P.vy+=1800*dt;if(mv(P,'y',P.vy*dt,8,22,S))P.vy=0;
+      if(A.down('confirm')&&sh<=0){sh=.3;const d=P.face===2?-1:1;pr.push({x:P.x+d*12,y:P.y+4,x0:P.x,vx:d*300,vy:0});SND.sfx('shoot')}   // magi bara höger/vänster, från midjehöjd (P.y+4 = 18 px över fötterna) så att den träffar låga markfiender som krukan
+      for(const b of pr){b.x+=b.vx*dt;if(blocked(b.x,b.y,2,2,S)||Math.abs(b.x-b.x0)>560){b.dead=1;continue}
+        for(const e of en){const E=ENEMIES[e.k];if(!e.dead&&Math.abs(e.x-b.x)<E.hw+4&&Math.abs(e.y-b.y)<E.hh+4){b.dead=1;hurt(e,b);break}}}
+      for(const b of ep){b.vy+=b.g*dt;b.x+=b.vx*dt;b.y+=b.vy*dt;if(blocked(b.x,b.y,2,2,S)){b.dead=1;continue}
+        if(inv<=0&&Math.abs(b.x-P.x)<12&&Math.abs(b.y-P.y)<24){b.dead=1;takeHit(b.atk)}}
+      pr=pr.filter(b=>!b.dead);ep=ep.filter(b=>!b.dead);en=en.filter(e=>!e.dead);
+      for(const e of en){const E=ENEMIES[e.k];if(Math.abs(e.x-P.x)>VW*.75)continue;if(e.hurt>0)e.hurt-=dt;   // fiender utanför skärmen vilar
+        if(e.kx){if(E.sp||E.hw)mv(e,'x',e.kx*dt,E.hw,E.hh,S);e.kx*=.001**dt;if(Math.abs(e.kx)<10)e.kx=0}else E.ai(e,dt,W);
+        if(inv<=0&&Math.abs(e.x-P.x)<E.hw+8&&Math.abs(e.y-P.y)<E.hh+22)takeHit(e.atk)}
+      for(const p of pk){p.vy+=1200*dt;if(mv(p,'y',p.vy*dt,6,6,S))p.vy=0;if(G.hp<hpMax(G)&&Math.abs(p.x-P.x)<18&&Math.abs(p.y-P.y)<30){p.dead=1;G.hp=Math.min(hpMax(G),G.hp+heartU(G));SND.sfx('pick')}}
+      pk=pk.filter(p=>!p.dead);for(const f of fl){f.t-=dt;f.y-=20*dt}fl=fl.filter(f=>f.t>0);
+      if(P.x<20)go('world');                                   // ut åt vänster = lämna via samma port
+      else if(G.hp<=0){G.hp=hpMax(G);done=1;UI.dialog(['Du föll i ruinerna och bars tillbaka till kartan.'],()=>go('world'))}
+      else if(!done&&P.x>(LEN-4)*T){done=1;UI.dialog(['Slutet på ruinstaden (platshållare).'],()=>go('world'))}},
+    draw(){const cx=Math.max(0,Math.min(LEN*T-VW,P.x-VW*.4)),gr=g.createLinearGradient(0,0,0,VH);gr.addColorStop(0,'#1b2238');gr.addColorStop(1,'#5a4458');g.fillStyle=gr;g.fillRect(0,0,VW,VH);
+      for(let i=cx/T|0;i<=(cx+VW)/T;i++){const x=i*T-cx;for(let j=GJ;j<17;j++)BLOCKS.rblock.d(x,j*T);for(let k=0;k<(h[i]||0);k++)BLOCKS.rblock.d(x,(GJ-1-k)*T)}
+      g.fillStyle='#e8c050';g.fillRect((LEN-4)*T-cx,(GJ-3)*T,3,3*T);g.fillRect((LEN-4)*T-cx,(GJ-3)*T,26,14);
+      g.save();g.translate(-cx,0);
+      for(const e of en)if(Math.abs(e.x-P.x)<VW*.75&&!(e.hurt>0&&(e.hurt*20|0)%2))ENEMIES[e.k].draw(e);
+      for(const p of pk)GFX.text('♥',p.x,p.y+5,'#ff5070',16,'center');
+      for(const b of pr){g.fillStyle='rgba(255,255,255,.3)';g.beginPath();g.arc(b.x,b.y,7,0,7);g.fill();g.fillStyle='#fff';g.beginPath();g.arc(b.x,b.y,4,0,7);g.fill()}
+      for(const b of ep){g.fillStyle='rgba(255,140,50,.35)';g.beginPath();g.arc(b.x,b.y,7,0,7);g.fill();g.fillStyle='#ffb050';g.beginPath();g.arc(b.x,b.y,4,0,7);g.fill()}
+      if(inv<=0||clock*12%2<1)GFX.person(P.x,P.y+22,P.face,P.ph,P.mv);
+      for(const f of fl){g.globalAlpha=Math.min(1,f.t*2);GFX.text(''+f.n,f.x,f.y,f.c,14,'center');g.globalAlpha=1}
+      g.restore();GFX.hud();if(ft<8)GFX.text('↑ hoppa (håll för högre) · Space/Z skjut åt det håll du tittar',VW/2,VH-20,'#c0c0d8',14,'center')}};})();
+
+/* ===== [SCENE:AIRFIELD] vertikal flygning: grå klippor, luftballonger och zeppelinare (hinder, kostar 1 hjärta) över grön mark med floder/sjöar (ofarliga) ===== */
+function airBands(seed,dur){const r=mulberry32(seedOf(seed,'airbg')),b=[];                 // vattenband över hela banbredden: [starttid, längd i sek]. Smala = flod, långa = sjö/hav
+  for(let t=1+r()*2;t<dur;){const sea=r()<.2,h=sea?.8+r()*.9:.22+r()*.2;b.push([+t.toFixed(2),+h.toFixed(2)]);t+=h+1.5+r()*3.5}return b}
+// ---- ballonger och zeppelinare (slumpas ur seed, sparas i G.maps.airfield). Ballong: [tid, x, variant, fas]. Zeppelinare: [tid, riktning, fart, variant] – tid är markens tidsaxel (som klipporna): en vågrät linje på marken som zeppelinaren flyger längs
+function airBalloons(seed,dur,obs){const r=mulberry32(seedOf(seed,'airballoon')),b=[],SPd=180;
+  for(let t=5+r()*2;t<dur-4;t+=1.6+r()*2.6){for(let tr=0;tr<6;tr++){const x=30+Math.floor(r()*420),v=r()*8|0;let ok=1;
+    for(const[to,xo,wo]of obs){const dy=(t-to)*SPd;if(dy>-52&&dy<44&&Math.abs(x-(xo+wo/2))<19+wo/2+14){ok=0;break}}   // håll ballongen fri från klippor
+    if(ok){b.push([+t.toFixed(2),x,v,+(r()*6.28).toFixed(2)]);break}}}return b}
+function airZeps(seed,dur){const r=mulberry32(seedOf(seed,'airzep')),z=[];
+  for(let t=7+r()*5;t<dur-8;t+=10+r()*9)z.push([+t.toFixed(2),r()<.5?-1:1,Math.round(300+r()*50),r()*4|0]);return z}
+(()=>{let dur,obs,bands,ft,done,inv,balloons,zeps;const SP=180,SY=540,zy0=t=>{const h=Math.abs(Math.sin(t*127.1+3.7)*43758.5453)%1,k=Math.abs(Math.sin(t*311.7)*9631.3)%1;return h<.5?290+Math.floor(k*7)*12:130+Math.floor(k*14)*12},SH=[['#5e646e','#8c939e','#3e434c'],['#6a707a','#9aa1ac','#454b55'],['#585d68','#868d98','#393e47']];
+  GEN.airfield=()=>{const r=rngFor('air'),dur=60+r()*60,obs=[];   // obs = [tid,x,bredd,variant]
+    for(let t=3;t<dur-3;t+=.6+r()*.8){const c=r()*5|0,n=1+(r()*3|0),x0=Math.floor(r()*(17-n))*28;obs.push([+t.toFixed(2),x0,n*28,c])}return{dur:+dur.toFixed(2),obs,bands:airBands(G.seed,+dur.toFixed(2)),balloons:airBalloons(G.seed,+dur.toFixed(2),obs),zeps:airZeps(G.seed,+dur.toFixed(2))}};
+  const rock=(x,y,n,c)=>{const sh=SH[c%3];
+    g.fillStyle='rgba(0,0,0,.28)';for(let k=0;k<n;k++){const ox=x+k*28;g.beginPath();g.moveTo(ox+27,y+27);g.lineTo(ox+27,y+14);g.lineTo(ox+35,y+21);g.lineTo(ox+37,y+27);g.fill()}   // skugga bara åt höger, foten i marknivå (ritas före bergen så grannberg täcker den)
+    for(let k=0;k<n;k++){const ox=x+k*28,pk=7+((c+k)*5%10);
+      g.fillStyle=sh[0];g.beginPath();g.moveTo(ox+1,y+27);g.lineTo(ox+4,y+10);g.lineTo(ox+pk,y+2);g.lineTo(ox+22,y+5);g.lineTo(ox+27,y+16);g.lineTo(ox+27,y+27);g.fill();
+      g.fillStyle=sh[1];g.beginPath();g.moveTo(ox+4,y+10);g.lineTo(ox+pk,y+2);g.lineTo(ox+pk+5,y+14);g.lineTo(ox+6,y+20);g.fill();                                           // upplyst sida
+      g.fillStyle=sh[2];g.beginPath();g.moveTo(ox+22,y+5);g.lineTo(ox+27,y+16);g.lineTo(ox+27,y+27);g.lineTo(ox+15,y+27);g.lineTo(ox+pk+5,y+14);g.fill()}};                      // skuggsida
+  const water=(y0,y1)=>{g.fillStyle='#2a5fa8';g.fillRect(0,y0,VW,y1-y0)};   // helt rakt blått fält över hela bredden: inga vågor, inga stränder
+
+  // ---- ballonger: stillastående i luften men "levande" (guppar, gungar, skuggan växer/krymper). Kollision på kropp + korg ----
+  const BAL=[['#d83a3a'],['#2f7fd0'],['#e8a020'],['#d83a3a','#f4f0e4','s'],['#2a58b8','#f2c830','s'],['#2f9a5a','#f4f0e4','b'],['#b83a9a','#f2c830','b'],['#f4f0e4','#d83a3a','z']];   // [färg, färg2, mönster: s=ränder, b=band, z=sicksack]
+  const bpos=(o,y)=>{const a=Math.sin(clock*1.5+o.f);return{x:o.x+Math.sin(clock*.9+o.f*1.7)*2,y:y-a*3,a}};
+  const bPath=(cx,cy,rx,ry)=>{g.beginPath();g.moveTo(cx,cy-ry);g.bezierCurveTo(cx+rx*1.15,cy-ry,cx+rx*1.1,cy+ry*.35,cx+rx*.22,cy+ry);g.lineTo(cx-rx*.22,cy+ry);g.bezierCurveTo(cx-rx*1.1,cy+ry*.35,cx-rx*1.15,cy-ry,cx,cy-ry)};
+  const bSide=(t,cx,cy,rx,ry)=>{const u=1-t,p=[[0,-ry],[rx*1.15,-ry],[rx*1.1,ry*.35],[rx*.22,ry]];   // punkt på ballongens högra kontur (t 0=topp, 1=botten)
+    return[cx+u*u*u*p[0][0]+3*u*u*t*p[1][0]+3*u*t*t*p[2][0]+t*t*t*p[3][0],cy+u*u*u*p[0][1]+3*u*u*t*p[1][1]+3*u*t*t*p[2][1]+t*t*t*p[3][1]]};
+  const bShadow=(x,y,a)=>{g.fillStyle='rgba(0,0,0,'+(.26-.05*a).toFixed(3)+')';g.beginPath();g.ellipse(x+22,y+46,15-3*a,8-1.6*a,0,0,7);g.fill()};   // skuggan krymper när ballongen stiger
+  const balloon=(o,y)=>{const q=bpos(o,y),cx=q.x,cy=q.y,rx=19,ry=22,v=BAL[o.v%BAL.length];
+    g.strokeStyle='#3a2a1a';g.lineWidth=1;g.beginPath();g.moveTo(cx-4,cy+ry);g.lineTo(cx-5,cy+31);g.moveTo(cx+4,cy+ry);g.lineTo(cx+5,cy+31);g.stroke();   // linor + korg
+    g.fillStyle='#8a5a2a';g.fillRect(cx-7,cy+31,14,9);g.fillStyle='#a8743a';g.fillRect(cx-7,cy+31,14,3);g.fillStyle='#5a3818';g.fillRect(cx-7,cy+37,14,3);
+    g.save();bPath(cx,cy,rx,ry);g.clip();g.fillStyle=v[0];g.fillRect(cx-rx*1.3,cy-ry,rx*2.6,ry*2+2);
+    if(v[2]==='s'){g.fillStyle=v[1];for(let k=-3;k<4;k+=2){const u0=k/3.5,u1=(k+1)/3.5;g.beginPath();for(let i=0;i<=10;i++){const[px,py]=bSide(i/10,cx,cy,rx,ry);g.lineTo(cx+(px-cx)*u0,py)}for(let i=10;i>=0;i--){const[px,py]=bSide(i/10,cx,cy,rx,ry);g.lineTo(cx+(px-cx)*u1,py)}g.fill()}}
+    else if(v[2]==='b'){g.fillStyle=v[1];g.fillRect(cx-rx*1.3,cy-ry*.45,rx*2.6,ry*.38);g.fillRect(cx-rx*1.3,cy+ry*.35,rx*2.6,ry*.3)}
+    else if(v[2]==='z'){g.fillStyle=v[1];for(let k=0;k<4;k++){g.beginPath();g.moveTo(cx-rx*1.3,cy-ry+k*11);for(let i=0;i<=8;i++)g.lineTo(cx-rx*1.3+i*rx*.325,cy-ry+k*11+(i%2?6:0));for(let i=8;i>=0;i--)g.lineTo(cx-rx*1.3+i*rx*.325,cy-ry+k*11+(i%2?11:5));g.fill()}}
+    const sx=-.35+Math.sin(clock*.8+o.f)*.06,gr=g.createRadialGradient(cx+rx*sx,cy-ry*.38,2,cx+rx*.1,cy,ry*1.15);   // 3D-skuggning, ljuspunkten vandrar långsamt
+    gr.addColorStop(0,'rgba(255,255,255,.5)');gr.addColorStop(.4,'rgba(255,255,255,0)');gr.addColorStop(1,'rgba(0,0,30,.45)');g.fillStyle=gr;g.fillRect(cx-rx*1.3,cy-ry,rx*2.6,ry*2+2);g.restore()};
+  const zpos=z=>{const e=ft-z.s0;return{x:z.d>0?-100+z.v*e:VW+100-z.v*e,y:SY-(z.t-ft)*SP,e}};   // vågrät rörelse längs en markfast linje: y scrollar med marken, x rör sig med egen fart
+  const zepActive=z=>{const e=ft-z.s0;return e>=0&&e<=(VW+200)/z.v};
+  const ZC=[['#c8ccd4','#8a909c'],['#d8b84a','#9a7a20'],['#8aa070','#586c48'],['#c85a4a','#8a3228']];
+  const zeppelin=z=>{const q=zpos(z),c=ZC[z.k%4];
+    g.fillStyle='rgba(0,0,0,.2)';g.beginPath();g.ellipse(q.x+20,q.y+52,64,9+Math.sin(clock*1.2+z.t)*1.2,0,0,7);g.fill();   // skugga på marken
+    g.save();g.translate(q.x,q.y);g.scale(z.d,1);
+    g.fillStyle=c[1];g.beginPath();g.moveTo(-62,-2);g.lineTo(-80,-20);g.lineTo(-50,-12);g.fill();g.beginPath();g.moveTo(-62,2);g.lineTo(-80,20);g.lineTo(-50,12);g.fill();   // fenor
+    g.fillStyle='#3a3a44';g.fillRect(-14,14,28,9);g.fillStyle='#8ac8e8';g.fillRect(-11,16,6,4);g.fillRect(-3,16,6,4);g.fillRect(5,16,6,4);g.fillStyle='#555';g.fillRect(-7,12,3,3);g.fillRect(4,12,3,3);   // gondol
+    g.beginPath();g.ellipse(0,0,66,18,0,0,7);g.save();g.clip();g.fillStyle=c[0];g.fillRect(-70,-20,140,40);
+    g.fillStyle=c[1];for(let i=-3;i<=3;i++)g.fillRect(i*18-1,-20,2,40);                                                    // sektionsband
+    if(z.k===1||z.k===3){g.fillStyle=z.k===1?'#c83a3a':'#f2eee0';g.fillRect(-70,-4,140,6)}
+    const gr=g.createLinearGradient(0,-18,0,18);gr.addColorStop(0,'rgba(255,255,255,.55)');gr.addColorStop(.35,'rgba(255,255,255,0)');gr.addColorStop(1,'rgba(0,0,30,.5)');g.fillStyle=gr;g.fillRect(-70,-20,140,40);g.restore();
+    g.fillStyle='#222';g.fillRect(-82,-1,3,2);g.strokeStyle='rgba(30,30,30,.7)';g.lineWidth=2;const pa=clock*40;g.beginPath();g.moveTo(-83,Math.sin(pa)*9);g.lineTo(-83,-Math.sin(pa)*9);g.stroke();   // propeller
+    g.restore()};
+  SCENES.airfield={w:480,h:640,music:'air',
+    enter(){const d=G.maps.airfield;dur=d.dur;ft=0;done=0;inv=0;obs=d.obs.map(([t,x,w,c])=>({t,x,w,c}));bands=d.bands;balloons=(d.balloons||[]).map(([t,x,v,f])=>({t,x,v,f}));zeps=(d.zeps||[]).map(([t,d,v,k])=>({t,d,v,k,s:0,s0:t-(SY-zy0(t))/SP}));   // s0 = tid då zeppelinaren glider in från sidan; y0 härleds ur tiden (sparformatet oförändrat): ~hälften som förut 290–362, ~hälften högre upp 130–286
+      P.x=240;P.y=SY},
+    update(dt){ft+=dt;inv-=dt;P.x=Math.max(16,Math.min(464,P.x+axis('left','right')*220*dt));P.y=Math.max(60,Math.min(620,P.y+axis('up','down')*180*dt));
+      for(const z of zeps)if(!z.s&&ft>=z.s0-.6){z.s=1;SND.boing(z.d)}   // varningsljud när en zeppelinare är på väg in från sidan
+      let hit=0;if(inv<=0){for(const o of obs){const y=SY-(o.t-ft)*SP;   // kollision: flygplanet (±9 × −12..+12) mot klippans fotavtryck
+        if(y>P.y-40&&y<P.y+40&&P.x+9>o.x+3&&P.x-9<o.x+o.w-3&&P.y+12>y+4&&P.y-12<y+27){hit=1;break}}
+        if(!hit)for(const o of balloons){const y=SY-(o.t-ft)*SP;if(y<P.y-80||y>P.y+80)continue;const q=bpos(o,y),dx=P.x-q.x,dy=P.y-q.y;   // ballong: ellipsformad kropp + liten korg
+          if((dx*dx)/(23*23)+(dy*dy)/(28*28)<1||(Math.abs(dx)<14&&P.y+12>q.y+30&&P.y-12<q.y+40)){hit=1;break}}
+        if(!hit)for(const z of zeps){if(!zepActive(z))continue;const q=zpos(z),dx=P.x-q.x,dy=P.y-q.y;if((dx*dx)/(72*72)+(dy*dy)/(28*28)<1||(Math.abs(dx)<16&&dy>0&&dy<34)){hit=1;break}}   // zeppelinare: avlång kropp + gondol
+        if(hit){inv=1.5;G.hp-=heartU(G);SND.sfx('hit')}}   // [TODO:COLLISION] hit = 1 hjärta
+      if(G.hp<=0){G.hp=hpMax(G);done=1;return UI.dialog(['Planet havererade mot klipporna och du bars tillbaka till kartan.'],()=>go('world'))}
+      if(!done&&ft>=dur){done=1;UI.dialog(['Landning genomförd (platshållare).'],()=>go('world'))}},
+    draw(){g.fillStyle='#3d7d38';g.fillRect(0,0,VW,VH);
+      for(let j=Math.floor((ft-(VH-SY)/SP)/.35);j<=Math.ceil((ft+SY/SP)/.35);j++){for(let q=0;q<1;q++){const h=Math.imul(j*4+q+1,2654435761)>>>0,x=h%VW,y=SY-(j*.35-ft)*SP+(h>>>9)%60-30;g.fillStyle=h&64?'#4f9448':'#34702f';g.fillRect(x,y,h&128?4:2,h&128?4:2)}}   // gräsfläckar som rullar med marken
+      for(const[t,h]of bands){const y1=SY-(t-ft)*SP,y0=SY-(t+h-ft)*SP;if(y1>-10&&y0<VH+10)water(y0,y1)}
+      for(const o of balloons){const y=SY-(o.t-ft)*SP;if(y>-70&&y<VH+50)bShadow(o.x,y,bpos(o,y).a)}
+      for(const o of obs){const y=SY-(o.t-ft)*SP;if(y>-40&&y<VH+30)rock(o.x,y,o.w/28,o.c)}
+      for(const o of balloons){const y=SY-(o.t-ft)*SP;if(y>-70&&y<VH+50)balloon(o,y)}
+      for(const z of zeps)if(zepActive(z))zeppelin(z);
+      if(inv<=0||clock*12%2<1){const x=P.x,y=P.y,wing=(x,y)=>{g.moveTo(x,y-16);g.lineTo(x+13,y+12);g.lineTo(x-13,y+12);g.closePath()},
+          fus=(x,y)=>{g.moveTo(x-3,y+12);g.lineTo(x-4,y-12);g.bezierCurveTo(x-4,y-16,x-2.4,y-18.5,x,y-18.5);g.bezierCurveTo(x+2.4,y-18.5,x+4,y-16,x+4,y-12);g.lineTo(x+3,y+12);g.closePath()};   // vingtriangel + kropp; nosen sticker ut 2,5 px framför vingspetsen
+        g.fillStyle='rgba(0,0,0,.22)';g.beginPath();wing(x+26,y+38);fus(x+26,y+38);g.fill();   // skugga: samma form som planet (vingar + kropp med nos), förskjuten nedåt höger med luft emellan. Båda delbanorna har samma riktning så de inte tar ut varandra
+        g.fillStyle='#fff';g.beginPath();wing(x,y);g.fill();
+        g.fillStyle='rgba(60,80,110,.16)';g.beginPath();g.moveTo(x+1,y-6);g.lineTo(x+13,y+12);g.lineTo(x+1,y+12);g.fill();   // svag skuggning på högra vingen (ljuset från vänster, som på ballongerna)
+        const fg=g.createLinearGradient(x-4,0,x+4,0);fg.addColorStop(0,'#9fb0c2');fg.addColorStop(.3,'#f4f8fc');fg.addColorStop(.62,'#b2c0d0');fg.addColorStop(1,'#5a6a7e');
+        g.fillStyle=fg;g.beginPath();fus(x,y);g.fill();   // flygkropp: överdelen av ett rör med rundad topp
+        g.strokeStyle='rgba(40,55,80,.55)';g.lineWidth=1;g.stroke();
+        g.fillStyle='rgba(255,255,255,.7)';g.fillRect(x-2,y-12,1,14)}   // glans längs kroppens övre vänstra sida
+      g.fillStyle='rgba(0,0,0,.35)';g.fillRect(10,VH-16,VW-20,6);g.fillStyle='#70d0ff';g.fillRect(10,VH-16,(VW-20)*Math.min(1,ft/dur),6);GFX.hud()}};})();
+
+/* ===== [BOOT] ===== */
+for(const k in BLOCKS)if(!CODE[k])console.error('Saknar teckenkod för block: '+k);
+newGame();go('title');requestAnimationFrame(frame);
+</script></body></html>
