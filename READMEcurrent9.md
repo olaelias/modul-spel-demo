@@ -104,9 +104,9 @@ Only the persistent state is intended to be saved and restored.
 | Action | Keys |
 |----------|----------|
 | Move | WASD / Arrow Keys |
-| Confirm | Space / Z |
+| Confirm | Space / Z / left click|
 | Cancel | Escape / X |
-| Pause | Enter |
+| Pause Menu| Enter / left click |
 | Mute | M |
 
 Game logic interacts with abstract actions rather than raw keyboard codes.
