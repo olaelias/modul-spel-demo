@@ -24,6 +24,7 @@ Work done on menus, save state, autosave, mouse controls.
 Basic player attack added, work on HP, str/wgt.
 
 # Adventure Game Template
+[https://github.com/olaelias/modul-spel-mall](https://github.com/olaelias/modul-spel-mall)
 
 A minimalist HTML5 Canvas framework for building adventure games in a single self-contained HTML file.
 
