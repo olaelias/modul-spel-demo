@@ -1,7 +1,7 @@
 ## Adventure game template demo
 <p align="center">
-  <img src="mall0.png" width="49%">
   <img src="mall3.png" width="49%">
+  <img src="mall0.png" width="49%">
 </p>
 <p align="center">
   <img src="mall1.png" width="49%">
