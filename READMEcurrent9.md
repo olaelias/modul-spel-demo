@@ -1,3 +1,15 @@
+![Screenshot](mall0.png)
+<p align="center">
+  <img src="mall1.png" width="49%">
+  <img src="mall2.png" width="49%">
+</p>
+
+## Play Online
+ 
+🎮 **Play in your browser**
+ 
+[https://olaelias.github.io/modul-spel-demo/](https://olaelias.github.io/modul-spel-demo/)
+
 ## Current progress
 
 ### Mall9
